@@ -1,0 +1,12 @@
+-- Issue #119: the quarantine path inserted the raw event row (autocommitting
+-- on its own) and then folded it in a *separate* transaction, so `isNew`
+-- (whether insertRawEvent's own INSERT reported a fresh row) was overloaded
+-- to also mean "not yet folded". A crash between the raw insert and the fold
+-- commit left the row durable but unfolded, and unrecoverable: on restart
+-- the row already existed, insertRawEvent returned false, and the event was
+-- silently skipped forever.
+--
+-- folded_at tracks fold completion independently of raw-row existence, so a
+-- crash in that window is retried on the next pass instead of stranding the
+-- event.
+ALTER TABLE events ADD COLUMN IF NOT EXISTS folded_at TIMESTAMPTZ;

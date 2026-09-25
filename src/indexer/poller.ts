@@ -159,18 +159,35 @@ async function resolveStartLedger(): Promise<number> {
   return Math.max(1, latest - config.indexer.startLookbackLedgers)
 }
 
-/** Insert one event's raw log row (idempotent on its unique id). Returns
- *  whether this call actually inserted it (`false` means already logged by
- *  an earlier attempt). Shared by the whole-page path and the per-event
- *  quarantine path (issue #43) so both write the same row the same way. */
+/** Insert one event's raw log row (idempotent on its unique id) and report
+ *  whether it still needs folding — i.e. `folded_at IS NULL` on the row that
+ *  now exists, regardless of whether *this* call did the inserting.
+ *
+ *  Fold completion is tracked independently of raw-row existence (issue
+ *  #119): the quarantine path commits this insert on its own, separately
+ *  from the fold that follows, so a crash in between leaves a raw row with
+ *  no fold. Keying "needs fold" off the row's own `folded_at` (rather than
+ *  off whether this INSERT was the one that created the row) means that on
+ *  retry the row is found to still need folding instead of being skipped.
+ *
+ *  Shared by the whole-page path and the per-event quarantine path (issue
+ *  #43) so both write the same row the same way. */
 async function insertRawEvent(client: PoolClient, ev: DecodedEvent): Promise<boolean> {
-  const ins = await client.query(
+  const res = await client.query<{ folded_at: string | null }>(
     `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash, decode_error)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-     ON CONFLICT (id) DO NOTHING`,
+     ON CONFLICT (id) DO UPDATE SET id = events.id
+     RETURNING folded_at`,
     [ev.id, ev.ledger, ev.closedAt, ev.contractId, ev.symbol, JSON.stringify(ev.topics), JSON.stringify(ev.data), ev.txHash, ev.decodeError ?? null]
   )
-  return ins.rowCount === 1
+  return res.rows[0]?.folded_at == null
+}
+
+/** Mark an event's row as folded — set in the same transaction as the fold
+ *  itself so `folded_at` is never non-null for a fold that didn't commit
+ *  (issue #119). */
+async function markFolded(client: PoolClient, id: string): Promise<void> {
+  await client.query('UPDATE events SET folded_at = now() WHERE id = $1', [id])
 }
 
 /** Persist a page of events + their derived side effects atomically.
@@ -209,13 +226,15 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
         )
       }
       // Raw log first (idempotent on the unique event id), then derived state.
-      const isNew = await insertRawEvent(client, ev)
+      const needsFold = await insertRawEvent(client, ev)
       // Fold only on first sight of an event id. A re-delivered page then
       // can't re-apply increments (issue #24, and the vote-tally hazard) —
-      // raw insert and fold are in one transaction, so isNew means
-      // "not yet folded".
-      if (isNew) {
+      // raw insert, fold, and the folded_at update are all in one
+      // transaction here, so needsFold accurately reflects "not yet folded"
+      // (issue #119).
+      if (needsFold) {
         await applyEvent(client, ev)
+        await markFolded(client, ev.id)
       }
     }
     await client.query('COMMIT')
@@ -249,6 +268,31 @@ async function recordQuarantinedEvent(ev: DecodedEvent, error: unknown): Promise
   console.error(`[indexer] quarantined event ${ev.id} (${ev.symbol}) at ledger ${ev.ledger}: ${message}`)
 }
 
+/** Record a quarantined event, tolerating a failure of the bookkeeping
+ *  insert itself (issue #120). Without this guard, an error here — a
+ *  constraint violation, disk full, a dropped connection — propagates out of
+ *  `ingestEventQuarantined`, aborting the `for` loop in
+ *  `ingestPageWithQuarantine` before it reaches any later event in the page
+ *  and before it resets `quarantineState`. The page is retried from the top
+ *  on the next poll, so nothing is stranded (`insertRawEvent`'s `folded_at`
+ *  check — issue #119 — still sees this event as needing a fold), but every
+ *  event after the one that hit the bookkeeping failure sits unfolded for
+ *  an extra pass, and the failure itself would otherwise go unlogged.
+ *
+ *  Swallowing it here instead lets the loop finish the rest of the page and
+ *  logs the failure loudly, so it isn't silent. */
+async function recordQuarantinedEventSafely(ev: DecodedEvent, error: unknown): Promise<void> {
+  try {
+    await recordQuarantinedEvent(ev, error)
+  } catch (recordErr) {
+    const recordMsg = recordErr instanceof Error ? recordErr.message : String(recordErr)
+    console.error(
+      `[indexer] failed to record quarantined event ${ev.id} (${ev.symbol}) in failed_events — ` +
+        `it was NOT folded and will be retried next pass: ${recordMsg}`
+    )
+  }
+}
+
 /** Fold exactly one event, each side in its own transaction (issue #43):
  *  the raw log insert commits on its own, so it survives untouched even if
  *  folding fails below — the append-only `events` row is never rolled back
@@ -257,7 +301,14 @@ async function recordQuarantinedEvent(ev: DecodedEvent, error: unknown): Promise
  *  recorded in `failed_events` instead — the rest of the page's events are
  *  unaffected, and the cursor still advances past this one. A ReorgDetectedError
  *  is never caught here; it propagates so the indexer still halts on a
- *  genuine rewind. */
+ *  genuine rewind.
+ *
+ *  Because the raw insert and the fold commit separately, a crash between
+ *  them (deploy, OOM, SIGKILL) would previously strand the row unfolded
+ *  forever — on restart the row already existed, so it looked already
+ *  handled (issue #119). `insertRawEvent`'s `folded_at` check makes
+ *  "needs folding" independent of "row exists", so that crash window is
+ *  just retried on the next pass instead. */
 async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Promise<void> {
   if (typeof ev.ledger === 'number' && lastLedger > 0 && ev.ledger < lastLedger) {
     throw new ReorgDetectedError(
@@ -279,16 +330,17 @@ async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Pro
     }
     lockAcquired = true
 
-    const isNew = await insertRawEvent(client, ev)
-    if (!isNew) return // already folded by an earlier attempt at this page
+    const needsFold = await insertRawEvent(client, ev)
+    if (!needsFold) return // already folded by an earlier attempt at this page
 
     try {
       await client.query('BEGIN')
       await applyEvent(client, ev)
+      await markFolded(client, ev.id)
       await client.query('COMMIT')
     } catch (err) {
       await client.query('ROLLBACK')
-      await recordQuarantinedEvent(ev, err)
+      await recordQuarantinedEventSafely(ev, err)
     }
   } finally {
     if (lockAcquired) {
@@ -469,7 +521,31 @@ export async function fetchOnce(contractId: string): Promise<void> {
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+/** Resolves after `ms`, or immediately if `signal` aborts first (issue
+ *  #121). The backoff delay after a failed poll can be up to
+ *  `POLL_MAX_BACKOFF_MS` (60s by default) — without racing it against the
+ *  abort signal, a SIGTERM arriving just after a failed poll would wait out
+ *  the entire backoff before the loop in `runIndexer` re-checks and exits.
+ *
+ *  Exported so this can be tested directly: `runIndexer` itself needs
+ *  CONTRACT_ID configured, which the test suite doesn't set. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
 
 /** Run the poll loop until stopped. Errors are logged and retried with
  *  exponential backoff (capped at `POLL_MAX_BACKOFF_MS`) so a stuck or down
@@ -515,7 +591,7 @@ export async function runIndexer(): Promise<void> {
           `[indexer] poll error (${consecutiveFailures} consecutive): ${msg} — retrying in ${delay}ms`
         )
       }
-      await sleep(delay)
+      await sleep(delay, abortController.signal)
     }
   } finally {
     running = false

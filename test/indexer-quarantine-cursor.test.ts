@@ -1,7 +1,10 @@
 // Covers issue #43 (quarantine path for a deterministically-throwing
-// handler) and issue #45 (the empty-page cursor conflation that produced a
-// false ReorgDetectedError). Both live in src/indexer/poller.ts and share
-// the same mock setup, so one file.
+// handler), issue #45 (the empty-page cursor conflation that produced a
+// false ReorgDetectedError), issue #119 (a crash between the raw insert and
+// the fold could strand an event unfolded forever) and issue #120 (a
+// failure recording a quarantined event must not abort the rest of the
+// page or strand the event silently). All four live in
+// src/indexer/poller.ts and share the same mock setup, so one file.
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { pool, query, queryOne } from '../src/db/index.js'
 import { fetchOnce, ReorgDetectedError } from '../src/indexer/poller.js'
@@ -125,6 +128,85 @@ describe('indexer: quarantine after repeated same-page failures (issue #43)', ()
 
     expect(await query('SELECT * FROM failed_events')).toHaveLength(0)
     expect(await query('SELECT * FROM events')).toHaveLength(0)
+  })
+
+  it('an event whose raw row was inserted but never folded — a crash between the two — is still folded on retry via the quarantine path (issue #119)', async () => {
+    const bad = decodedEvent('loan_dflt', { loan_id: 1, borrower: 'GB' })
+    // loan_dflt with no penalty field — deterministic FieldValidationError,
+    // same as the other tests in this file, needed to drive the page into
+    // per-event quarantine mode.
+    const crashed = decodedEvent('joined', { member: 'GA', fee: '10' })
+    const page = [bad, crashed]
+    getEventsMock.mockResolvedValue({ events: page, cursor: 'tok-after', latestLedger: 100_000 })
+
+    // Simulate an earlier attempt that got as far as insertRawEvent's own
+    // autocommitting INSERT but crashed before the fold's COMMIT: the raw
+    // row exists, folded_at is unset, and no derived state exists for it.
+    await pool.query(
+      `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [crashed.id, crashed.ledger, crashed.closedAt, crashed.contractId, crashed.symbol,
+       JSON.stringify(crashed.topics), JSON.stringify(crashed.data), crashed.txHash]
+    )
+
+    await expect(fetchOnce('CTESTCONTRACT')).rejects.toThrow(/penalty/)
+    await expect(fetchOnce('CTESTCONTRACT')).rejects.toThrow(/penalty/)
+    // Quarantine kicks in on the third attempt. `crashed`'s raw row already
+    // exists, but it must still be folded — insertRawEvent now keys "needs
+    // folding" off folded_at, not off whether this call did the inserting.
+    await expect(fetchOnce('CTESTCONTRACT')).resolves.toBeUndefined()
+
+    const members = await query<{ address: string }>('SELECT address FROM members ORDER BY address')
+    expect(members.map((m) => m.address)).toEqual(['GA'])
+
+    const rows = await query<{ id: string; folded_at: string | null }>(
+      'SELECT id, folded_at FROM events ORDER BY id'
+    )
+    expect(rows.find((r) => r.id === crashed.id)?.folded_at).not.toBeNull()
+  })
+
+  it('a failure recording the quarantined event in failed_events does not strand it or abort the rest of the page (issue #120)', async () => {
+    const bad = decodedEvent('loan_dflt', { loan_id: 1, borrower: 'GA' })
+    const good = decodedEvent('joined', { member: 'GB', fee: '20' })
+    const page = [bad, good]
+    getEventsMock.mockResolvedValue({ events: page, cursor: 'tok-after', latestLedger: 100_000 })
+
+    await expect(fetchOnce('CTESTCONTRACT')).rejects.toThrow(/penalty/)
+    await expect(fetchOnce('CTESTCONTRACT')).rejects.toThrow(/penalty/)
+
+    // Make the failed_events bookkeeping insert itself fail — a real
+    // database-level failure (table briefly unavailable), standing in for
+    // the constraint violation / disk full / dropped connection the issue
+    // names. Restored in `finally` so later tests' resetDb() (which
+    // truncates failed_events by name) isn't broken by this.
+    await pool.query('ALTER TABLE failed_events RENAME TO failed_events_missing_120')
+    try {
+      // Third consecutive identical failure — quarantine kicks in. Recording
+      // `bad` in failed_events fails, but this must still resolve (not
+      // throw) and must still fold `good`, the event after it in the page.
+      await expect(fetchOnce('CTESTCONTRACT')).resolves.toBeUndefined()
+    } finally {
+      await pool.query('ALTER TABLE failed_events_missing_120 RENAME TO failed_events')
+    }
+
+    const members = await query<{ address: string }>('SELECT address FROM members ORDER BY address')
+    expect(members.map((m) => m.address)).toEqual(['GB'])
+
+    // The bookkeeping insert failed, so nothing landed in failed_events...
+    expect(await query('SELECT * FROM failed_events')).toHaveLength(0)
+
+    // ...but the raw row for the un-recordable event is still there, marked
+    // as not-yet-folded — the forensic trail an operator needs (issue #119)
+    // now that a fold failure can't hide behind a failed_events row either.
+    const badRow = await queryOne<{ folded_at: string | null }>(
+      'SELECT folded_at FROM events WHERE id = $1',
+      [bad.id]
+    )
+    expect(badRow?.folded_at).toBeNull()
+
+    // The indexer still made progress — cursor advanced past the page.
+    const row = await cursorRow()
+    expect(row?.paging_token).toBe(good.id)
   })
 })
 

@@ -51,7 +51,15 @@ CREATE TABLE IF NOT EXISTS events (
   data        JSONB NOT NULL,
   tx_hash     TEXT,
   decode_error TEXT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Set when this event's derived-state fold has committed — independent of
+  -- the row's own existence, so a crash between the raw insert and the fold
+  -- (quarantine path) can be detected and retried rather than silently
+  -- skipped (issue #119). Declared last, matching where the
+  -- 0016_events_folded_at.sql ALTER TABLE physically appends it on a
+  -- database that already had this table (schema.sql's own column order
+  -- only governs a truly fresh bootstrap).
+  folded_at   TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS events_symbol_idx ON events (symbol);
 CREATE INDEX IF NOT EXISTS events_ledger_idx ON events (ledger);
