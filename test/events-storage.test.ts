@@ -56,7 +56,9 @@ describe('events log — storage shape is pinned (issue #75)', () => {
       { column_name: 'topics', data_type: 'jsonb' },
       { column_name: 'data', data_type: 'jsonb' },
       { column_name: 'tx_hash', data_type: 'text' },
+      { column_name: 'decode_error', data_type: 'text' },
       { column_name: 'created_at', data_type: 'timestamp with time zone' },
+      { column_name: 'folded_at', data_type: 'timestamp with time zone' },
     ])
   })
 
