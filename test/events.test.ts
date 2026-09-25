@@ -65,6 +65,29 @@ describe('decodeEvent', () => {
     expect(ev.fields.weight).toBeNull()
   })
 
+  it('decodes loan_wait/tre_wait (id, amount) and loan_rej/tre_rej (id, for_votes, against_votes) (issues #123-125)', () => {
+    const waitData = tuple(nativeToScVal(7, { type: 'u32' }), nativeToScVal(1_000_000_000_000n, { type: 'i128' }))
+    for (const symbol of ['loan_wait', 'tre_wait'] as const) {
+      const ev = decodeEvent(makeEvent(symbol, waitData))
+      expect(Object.keys(ev.fields)).toEqual(EVENT_FIELDS[symbol])
+      expect(ev.fields.id).toBe(7)
+      expect(typeof ev.fields.amount).toBe('string')
+    }
+
+    const rejData = tuple(
+      nativeToScVal(8, { type: 'u32' }),
+      nativeToScVal(200_000_000_000n, { type: 'i128' }),
+      nativeToScVal(500_000_000_000n, { type: 'i128' })
+    )
+    for (const symbol of ['loan_rej', 'tre_rej'] as const) {
+      const ev = decodeEvent(makeEvent(symbol, rejData))
+      expect(Object.keys(ev.fields)).toEqual(EVENT_FIELDS[symbol])
+      expect(ev.fields.id).toBe(8)
+      expect(ev.fields.for_votes).toBe('200000000000')
+      expect(ev.fields.against_votes).toBe('500000000000')
+    }
+  })
+
   it('falls back to an empty fields map for an unknown symbol, but keeps the raw data', () => {
     const data = tuple(nativeToScVal(1, { type: 'u32' }))
     const ev = decodeEvent(makeEvent('totally_unknown_symbol', data))

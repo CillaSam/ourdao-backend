@@ -4,14 +4,28 @@
 
 // The complete set of values each status column may hold, in one place (#73).
 // The database CHECK constraints — inline in src/db/schema.sql and added to
-// existing databases by src/db/migrations/0012_status_check_constraints.sql —
-// must accept exactly these, and test/status-constraints.test.ts fails if the
-// two drift. `'cancelled'` is a declared loan-proposal state that no handler
-// writes yet; it is kept deliberately (the loan_exp work will use it for
-// expired proposals) rather than dropped.
-export const LOAN_PROPOSAL_STATUSES = ['pending', 'approved', 'rejected', 'cancelled'] as const
+// existing databases by src/db/migrations/0012_status_check_constraints.sql
+// (and, for `approved_pending_disbursement`, 0017_approved_pending_disbursement_status.sql)
+// — must accept exactly these, and test/status-constraints.test.ts fails if
+// the two drift. `'cancelled'` is a declared loan-proposal state that no
+// handler writes yet; it is kept deliberately (the loan_exp work will use it
+// for expired proposals) rather than dropped. `'approved_pending_disbursement'`
+// is the state a proposal sits in between reaching quorum and actually being
+// disbursed once the treasury can cover it (`loan_wait`/`tre_wait`, issue #125).
+export const LOAN_PROPOSAL_STATUSES = [
+  'pending',
+  'approved',
+  'rejected',
+  'cancelled',
+  'approved_pending_disbursement',
+] as const
 export const LOAN_STATUSES = ['active', 'repaid', 'defaulted'] as const
-export const TREASURY_PROPOSAL_STATUSES = ['pending', 'executed', 'rejected'] as const
+export const TREASURY_PROPOSAL_STATUSES = [
+  'pending',
+  'executed',
+  'rejected',
+  'approved_pending_disbursement',
+] as const
 
 export type LoanProposalStatus = (typeof LOAN_PROPOSAL_STATUSES)[number]
 export type LoanStatus = (typeof LOAN_STATUSES)[number]
