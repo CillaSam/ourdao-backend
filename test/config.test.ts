@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   assertContractConfigured,
   bool,
   int,
+  nonceStore,
   resolveConfig,
   str,
 } from '../src/config.js'
@@ -31,6 +32,22 @@ describe('config helpers', () => {
     expect(bool({ VALUE: '1' }, 'VALUE')).toBe(true)
     expect(bool({ VALUE: 'false' }, 'VALUE', true)).toBe(false)
     expect(bool({ VALUE: 'unexpected' }, 'VALUE', true)).toBe(false)
+  })
+
+  it('nonceStore accepts postgres/memory (any case, trimmed) and falls back with a warning otherwise (issue #118)', () => {
+    expect(nonceStore({}, 'NONCE_STORE')).toBe('postgres')
+    expect(nonceStore({ NONCE_STORE: '' }, 'NONCE_STORE')).toBe('postgres')
+    expect(nonceStore({ NONCE_STORE: 'memory' }, 'NONCE_STORE')).toBe('memory')
+    expect(nonceStore({ NONCE_STORE: ' Postgres ' }, 'NONCE_STORE')).toBe('postgres')
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(nonceStore({ NONCE_STORE: 'redis' }, 'NONCE_STORE')).toBe('postgres')
+      expect(nonceStore({ NONCE_STORE: 'typo' }, 'NONCE_STORE', 'memory')).toBe('memory')
+      expect(warn).toHaveBeenCalledTimes(2)
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
 
@@ -86,6 +103,17 @@ describe('resolveConfig', () => {
     expect(resolved.stellar.contractId).toBe('C123')
     expect(resolved.indexer.pollIntervalMs).toBe(5000)
     expect(resolved.indexer.resetOnContractChange).toBe(true)
+  })
+
+  it('falls back to postgres and warns when NONCE_STORE is unrecognized (issue #118)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const resolved = resolveConfig({ NONCE_STORE: 'redis' })
+      expect(resolved.db.nonceStore).toBe('postgres')
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
 

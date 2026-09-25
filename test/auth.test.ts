@@ -286,7 +286,7 @@ describe('authenticateRequest — characterization (#72)', () => {
     await store.shutdown()
   })
 
-  it('pins current ordering: the nonce is consumed before the signature check, so a bad-signature request still spends its nonce', async () => {
+  it('verifies the signature before consuming the nonce, so a bad-signature request never spends it (issue #115)', async () => {
     const store = new MemoryNonceStore()
     const nonce = await store.issue(G)
     const first = await authenticateRequest(
@@ -294,8 +294,9 @@ describe('authenticateRequest — characterization (#72)', () => {
       store,
     )
     expect(first).toMatchObject({ authenticated: false, error: 'Invalid signature' })
+    // The nonce must still be alive: a correctly-signed follow-up succeeds.
     const second = await authenticateRequest(headersFor(G, nonce), store)
-    expect(second).toMatchObject({ authenticated: false, error: 'Invalid or expired nonce' })
+    expect(second).toEqual({ authenticated: true, address: G })
     await store.shutdown()
   })
 })

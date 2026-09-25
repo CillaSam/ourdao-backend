@@ -23,7 +23,7 @@ import type {
   FailedEventRow,
   TimelineEntry,
 } from '../../types.js'
-import { authenticateRequest, isValidStellarAddress, type NonceStore } from '../../auth.js'
+import { authenticateRequest, classifyStellarAddress, type NonceStore } from '../../auth.js'
 
 function parseLimit(v: unknown, def = 50, max = 200): number | null {
   if (v === undefined || v === null || v === '') return def
@@ -156,17 +156,14 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       return reply.code(400).send({ error: 'address query param is required' })
     }
     
-    // Validate address is a well-formed Stellar public key (issue #65)
-    if (!isValidStellarAddress(address)) {
+    // Validate address is a well-formed Stellar address (issue #65). Accept
+    // both families verifySignature can resolve — ed25519 and muxed (issue
+    // #116) — and reject contract (C…) and anything malformed.
+    const addressType = classifyStellarAddress(address)
+    if (addressType !== 'ed25519' && addressType !== 'muxed') {
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
-    
-    // Bound the request: reject over-long address (issue #65)
-    const MAX_ADDRESS_LENGTH = 56 // Stellar public keys are 56 characters
-    if (address.length > MAX_ADDRESS_LENGTH) {
-      return reply.code(400).send({ error: 'address too long' })
-    }
-    
+
     try {
       const nonce = await nonceStore.issue(address)
       return { nonce }

@@ -319,16 +319,18 @@ export async function authenticateRequest(
     return { authenticated: false, status: 401, error: 'Missing authentication headers' }
   }
 
-  // Check if the nonce is valid and hasn't been used
-  const nonceValid = await nonceStore.consume(address, nonce)
-  if (!nonceValid) {
-    return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
-  }
-
-  // Verify the signature
+  // Verify the signature first — consuming the nonce before this would let
+  // anyone who reads a victim's (non-secret, by design) challenge burn it
+  // with a garbage signature, denying the victim's real request (issue #115).
   const sig = verifySignature(address, nonce, signature)
   if (!sig.ok) {
     return { authenticated: false, status: sig.status, error: sig.error }
+  }
+
+  // Only now consume the nonce, so a bad signature never spends it.
+  const nonceValid = await nonceStore.consume(address, nonce)
+  if (!nonceValid) {
+    return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
   }
 
   // If a target address is provided, ensure it matches the authenticated address
