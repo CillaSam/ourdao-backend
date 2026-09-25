@@ -34,9 +34,19 @@ export interface MemberRow {
 
 export interface MemberSummary {
   member: MemberRow
+  // Capped at LOANS_EMBED_LIMIT (issue #165) — loans_truncated is true when
+  // the member has more than that; the full history is paginated separately
+  // via GET /api/loans?borrower=<address>. The aggregate counts in
+  // `position` below are computed over ALL of the member's loans regardless
+  // of this cap, never just the embedded page.
   loans: (LoanRow & { interest_charge: string; repaid_amount: string })[]
+  loans_total_count: number
+  loans_truncated: boolean
   unread_notifications: number
   position: {
+    // Share of currently-active total contribution/stake (issue #164) —
+    // matches ourdao-contracts' calculate_exit_share, which is 0 for any
+    // non-active member and otherwise contribution / total_active_contributions.
     contribution_share_bps: string
     stake_share_bps: string
     repaid_loans_count: number

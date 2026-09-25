@@ -23,17 +23,23 @@ interface PackageJson {
   version: string
 }
 
-// Helper to read package.json version
-function readPackageVersion(): string {
+// Read once at module load — the version cannot change while the process
+// is running, so there is no reason for `/version` to hit the filesystem
+// on every request (issue #166). `/version` sits in the rate limiter's
+// allowList alongside `/health` and `/ready`, so it is otherwise the one
+// unthrottled endpoint that would do disk I/O per call.
+function readPackageVersion(): { version: string; error?: unknown } {
   try {
     const __dirname = dirname(fileURLToPath(import.meta.url))
     const pkgPath = join(__dirname, '../../package.json')
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as PackageJson
-    return pkg.version
-  } catch {
-    return 'unknown'
+    return { version: pkg.version }
+  } catch (error) {
+    return { version: 'unknown', error }
   }
 }
+
+const packageVersionResult = readPackageVersion()
 
 export interface BuildServerOptions {
   /**
@@ -56,6 +62,14 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // One error shape for every failure — installed before routes so every child
   // context inherits it (issue #81).
   registerErrorHandling(app)
+
+  // A failed package.json read is reported once at startup, rather than
+  // silently returning 'unknown' from every future /version call — a
+  // packaging mistake (e.g. the relative path resolving differently from
+  // dist/ than from src/) should fail visibly, not forever (issue #166).
+  if (packageVersionResult.error) {
+    app.log.error({ err: packageVersionResult.error }, 'Failed to read package.json version; /version will report "unknown"')
+  }
 
   // Select nonce store implementation based on config (issue #66)
   let nonceStore: NonceStore
@@ -97,7 +111,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
 
   // ── Version endpoint (issue #64) — build metadata ──
   app.get('/version', async () => ({
-    version: readPackageVersion(),
+    version: packageVersionResult.version,
     commit: process.env.SOURCE_COMMIT ?? 'unknown',
     buildDate: process.env.BUILD_DATE ?? 'unknown',
   }))

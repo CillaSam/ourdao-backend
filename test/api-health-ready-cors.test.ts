@@ -1,5 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
+import { readFileSync } from 'fs'
+import { join } from 'path'
 import { buildServer } from '../src/api/server.js'
 import { query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
@@ -66,6 +68,19 @@ describe('API: /health and /ready', () => {
     // Should have sensible defaults when env vars are not set
     expect(body.commit).toBe('unknown')
     expect(body.buildDate).toBe('unknown')
+  })
+
+  it('GET /version reports the real package.json version, not "unknown" (issue #166)', async () => {
+    const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf-8')) as { version: string }
+    const res = await app.inject({ method: 'GET', url: '/version' })
+    expect(res.json().version).toBe(pkg.version)
+  })
+
+  it('GET /version returns the same value across repeated calls (read once at module load, not per request)', async () => {
+    const first = (await app.inject({ method: 'GET', url: '/version' })).json()
+    const second = (await app.inject({ method: 'GET', url: '/version' })).json()
+    expect(second.version).toBe(first.version)
+    expect(first.version).not.toBe('unknown')
   })
 
   it('GET /ready returns 200 with cold start when no cursor exists', async () => {

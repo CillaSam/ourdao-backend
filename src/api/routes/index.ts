@@ -38,6 +38,13 @@ function invalidLimit(v: unknown, def = 50, max = 200): boolean {
   return parseLimit(v, def, max) === null
 }
 
+// Issue #165: how many of a member's loans /members/:address/summary embeds
+// inline. The full history is always available, paginated, from
+// GET /api/loans?borrower=<address> — this cap only bounds the size of the
+// summary payload itself. Named so the LIMIT and the has-more comparison
+// it's checked against can never drift apart.
+const LOANS_EMBED_LIMIT = 100
+
 // Small helper: clamp a `limit` query param to a sane range.
 function limit(v: unknown, def = 50, max = 200): number {
   return parseLimit(v, def, max) ?? def
@@ -211,41 +218,70 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
         SELECT * FROM members WHERE address = $1
       ),
       totals AS (
-        SELECT 
-          (SELECT COALESCE(SUM(contribution), 0) FROM members WHERE joined_ledger IS NOT NULL) as total_contribution,
+        -- Issue #164: both denominators must match the contract's own
+        -- definition of a member's claim. calculate_exit_share() in
+        -- ourdao-contracts (contracts/dao/src/membership.rs) computes
+        -- treasury * contribution / total_active_contributions, where
+        -- total_active_contributions sums 'contribution' only over members
+        -- with MemberStatus::ActiveMember — the same exited = false this
+        -- table already (correctly) uses for total_stake, and for
+        -- active_members/total_staked in /api/stats. contribution_share_bps
+        -- is therefore a member's share of *currently active* contribution,
+        -- matching what the contract would actually pay on exit, not a
+        -- share of every contribution ever made including exited members'.
+        SELECT
+          (SELECT COALESCE(SUM(contribution), 0) FROM members WHERE exited = false) as total_contribution,
           (SELECT COALESCE(SUM(stake), 0) FROM members WHERE exited = false) as total_stake
       ),
       unread_notifs AS (
         SELECT COUNT(*) as unread_count FROM notifications WHERE address = $1 AND read = false
       ),
-      member_loans AS (
-        SELECT COALESCE(json_agg(row_to_json(l)), '[]'::json) as loans,
+      -- Issue #165: aggregates run over the member's *entire* loan history —
+      -- independent of ${LOANS_EMBED_LIMIT}, the cap on the embedded list
+      -- below — so a long-tenured member's repaid/defaulted counts and
+      -- defaulted value are never silently wrong just because they have
+      -- more than ${LOANS_EMBED_LIMIT} loans.
+      member_loans_agg AS (
+        SELECT COUNT(*) as total_count,
                COUNT(*) FILTER (WHERE status = 'repaid') as repaid_loans_count,
                COUNT(*) FILTER (WHERE status = 'defaulted') as defaulted_loans_count,
                COALESCE(SUM(outstanding) FILTER (WHERE status = 'defaulted'), 0) as defaulted_loans_value
+        FROM loans WHERE borrower = $1
+      ),
+      -- The embedded list itself stays capped at ${LOANS_EMBED_LIMIT} (full
+      -- history is available, paginated, from GET /api/loans?borrower=) but
+      -- now with an explicit column list instead of SELECT *, and the
+      -- truncation is now visible via loans_total_count/loans_truncated
+      -- below rather than silent.
+      member_loans_embed AS (
+        SELECT COALESCE(json_agg(row_to_json(l)), '[]'::json) as loans
         FROM (
-          SELECT * FROM loans WHERE borrower = $1 ORDER BY id DESC LIMIT 100
+          SELECT id, borrower, amount, outstanding, total_repayment, status,
+                 approved_ledger, due_time, repaid_ledger, defaulted_ledger, updated_at
+          FROM loans WHERE borrower = $1 ORDER BY id DESC LIMIT ${LOANS_EMBED_LIMIT}
         ) l
       )
-      SELECT 
+      SELECT
         json_build_object(
           'member', row_to_json(m.*),
-          'loans', (SELECT loans FROM member_loans),
+          'loans', (SELECT loans FROM member_loans_embed),
+          'loans_total_count', (SELECT total_count::int FROM member_loans_agg),
+          'loans_truncated', (SELECT total_count > ${LOANS_EMBED_LIMIT} FROM member_loans_agg),
           'unread_notifications', (SELECT unread_count::int FROM unread_notifs),
           'position', json_build_object(
-            'contribution_share_bps', CASE 
-              WHEN (SELECT total_contribution FROM totals) > 0 
-              THEN TRUNC((m.contribution * 10000) / (SELECT total_contribution FROM totals))::text 
-              ELSE '0' 
+            'contribution_share_bps', CASE
+              WHEN (SELECT total_contribution FROM totals) > 0 AND m.exited = false
+              THEN TRUNC((m.contribution * 10000) / (SELECT total_contribution FROM totals))::text
+              ELSE '0'
             END,
-            'stake_share_bps', CASE 
+            'stake_share_bps', CASE
               WHEN (SELECT total_stake FROM totals) > 0 AND m.exited = false
-              THEN TRUNC((m.stake * 10000) / (SELECT total_stake FROM totals))::text 
-              ELSE '0' 
+              THEN TRUNC((m.stake * 10000) / (SELECT total_stake FROM totals))::text
+              ELSE '0'
             END,
-            'repaid_loans_count', COALESCE((SELECT repaid_loans_count::int FROM member_loans), 0),
-            'defaulted_loans_count', COALESCE((SELECT defaulted_loans_count::int FROM member_loans), 0),
-            'defaulted_loans_value', COALESCE((SELECT defaulted_loans_value FROM member_loans), 0)::text
+            'repaid_loans_count', COALESCE((SELECT repaid_loans_count::int FROM member_loans_agg), 0),
+            'defaulted_loans_count', COALESCE((SELECT defaulted_loans_count::int FROM member_loans_agg), 0),
+            'defaulted_loans_value', COALESCE((SELECT defaulted_loans_value FROM member_loans_agg), 0)::text
           )
         ) as summary
       FROM m
@@ -647,15 +683,40 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // (without touching the append-only `events` row), and moves on. This is
   // the operator-facing view of that; `/api/stats.quarantinedEvents` is the
   // dashboard-facing count.
+  //
+  // Issue #163: the `/admin/` prefix has two different meanings in this file
+  // — `/admin/log` is a public governance audit trail read straight off the
+  // chain, with nothing sensitive in it, while this endpoint surfaces
+  // `failed_events.error`, which is the raw driver/handler exception text
+  // `classifyError` goes to some trouble to keep out of every other
+  // response. Rather than invent an admin-auth scheme this codebase has no
+  // other trace of, `/admin/` here means "operator diagnostics": reachable
+  // without authentication, but never echoing back anything an unauthed
+  // caller couldn't already learn some other way. So the fix mirrors
+  // `classifyError`'s own rule — raw exception text is never put in a
+  // response, only logged (and still queryable directly against Postgres by
+  // an operator) — rather than gating the whole endpoint behind auth.
   app.get('/admin/failed-events', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const q = req.query as Record<string, unknown>
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
-    return query<FailedEventRow>(
-      'SELECT * FROM failed_events ORDER BY id DESC LIMIT $1',
-      [l]
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    const params: unknown[] = []
+    let where = ''
+    if (before !== null) {
+      params.push(before)
+      where = `WHERE id < $${params.length}`
+    }
+    params.push(l)
+    const rows = await query<Omit<FailedEventRow, 'error'>>(
+      `SELECT id, event_id, symbol, ledger, created_at
+         FROM failed_events ${where}
+        ORDER BY id DESC LIMIT $${params.length}`,
+      params
     )
+    return rows
   })
 
   // --- Aggregate stats (with indexer freshness — issue #2) ---
