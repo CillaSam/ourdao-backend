@@ -29,6 +29,23 @@ export function logLevel(env: NodeJS.ProcessEnv, name: string, fallback = 'info'
   return PINO_LEVELS.has(level) ? level : fallback
 }
 
+const NONCE_STORES = new Set(['postgres', 'memory'])
+
+/**
+ * Parse the NONCE_STORE env var, falling back to 'postgres' (with a logged
+ * warning) for anything unrecognized. An unvalidated typo here used to
+ * silently downgrade to the in-memory store — the exact multi-instance auth
+ * failure issue #66 was filed to fix (issue #118).
+ */
+export function nonceStore(env: NodeJS.ProcessEnv, name: string, fallback: 'postgres' | 'memory' = 'postgres'): 'postgres' | 'memory' {
+  const v = env[name]
+  if (v === undefined || v === '') return fallback
+  const value = v.trim().toLowerCase()
+  if (NONCE_STORES.has(value)) return value as 'postgres' | 'memory'
+  console.warn(`[config] Invalid NONCE_STORE "${v}" — falling back to "${fallback}". Expected one of: ${[...NONCE_STORES].join(', ')}`)
+  return fallback
+}
+
 /**
  * Parse the CORS_ORIGIN env var into a Fastify-compatible origin value.
  *
@@ -72,7 +89,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // pg reads PG* env vars automatically; connectionString wins when set.
     connectionString: str(env, 'DATABASE_URL') || undefined,
     // Nonce store implementation: 'postgres' for production (multi-instance), 'memory' for testing (issue #66)
-    nonceStore: str(env, 'NONCE_STORE', 'postgres') as 'postgres' | 'memory',
+    nonceStore: nonceStore(env, 'NONCE_STORE', 'postgres'),
   },
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),
