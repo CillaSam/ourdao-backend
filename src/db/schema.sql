@@ -20,10 +20,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 -- Indexer resume state (single row, id = 1).
--- `last_ledger_hash` is the ledger-hash of the RPC's reported tip at the time
--- the cursor was last advanced (Soroban getEvents exposes no per-event hash);
--- it is forensic context for a detected discontinuity, not a verified
--- processed-ledger hash. See issue #23 / README "Reorg detection".
+-- `last_ledger_hash` is the hash of `last_ledger` itself — the ledger
+-- actually folded to (issue #127) — fetched by sequence from the RPC
+-- (Soroban getEvents exposes no per-event hash). Re-checked against the
+-- RPC's current hash for that same sequence on every poll to catch a
+-- same-height fork the sequence-only continuity check can't see (issue
+-- #128). See README "Reorg detection".
 -- `observed_tip_ledger` (issue #45) is the RPC's most recently observed chain
 -- tip — freshness/reporting only, distinct from `last_ledger` (the highest
 -- ledger actually folded, which the reorg continuity check uses). An empty

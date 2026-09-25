@@ -2,7 +2,7 @@ import type { rpc } from '@stellar/stellar-sdk'
 import type { PoolClient } from 'pg'
 import { config, assertContractConfigured } from '../config.js'
 import { pool, queryOne } from '../db/index.js'
-import { server, getLatestLedger, getLatestLedgerInfo } from '../stellar/rpc.js'
+import { server, getLatestLedger, getLatestLedgerInfo, getLedgerHash } from '../stellar/rpc.js'
 import { decodeEvent, type DecodedEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
 import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
@@ -435,6 +435,22 @@ export async function fetchOnce(contractId: string): Promise<void> {
     )
   }
 
+  // Same-height fork check (issue #128): the coarse check above only catches
+  // a rewind that moves the sequence backwards. A same-height fork — history
+  // diverging without the ledger count going down — is invisible to it, but
+  // changes the hash of the ledger already folded to. Compare what's stored
+  // for `priorLedger` (issue #127: genuinely its hash now, not the tip's)
+  // against what the RPC reports for that same sequence today.
+  if (priorLedger > 0 && cursor?.last_ledger_hash) {
+    const actualHash = await getLedgerHash(priorLedger)
+    // null means the RPC has pruned that ledger — unverifiable, not a fork.
+    if (actualHash !== null && actualHash !== cursor.last_ledger_hash) {
+      throw new ReorgDetectedError(
+        `ledger ${priorLedger}'s hash changed from ${cursor.last_ledger_hash} to ${actualHash} — history diverged at the same height`
+      )
+    }
+  }
+
   const base = {
     filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] as string[][] }],
     limit: config.indexer.pageLimit,
@@ -448,6 +464,7 @@ export async function fetchOnce(contractId: string): Promise<void> {
   const drainStart = Date.now()
   let totalEvents = 0
   let lastLedger = cursor?.last_ledger ?? 0
+  let lastLedgerHash = cursor?.last_ledger_hash ?? null
   let observedTipLedger = cursor?.observed_tip_ledger ?? tip.sequence
   let cursorWritten = false
 
@@ -481,8 +498,13 @@ export async function fetchOnce(contractId: string): Promise<void> {
     // never fed into the continuity check above or in ingestPage.
     const newObservedTip = res.latestLedger ?? observedTipLedger
     if (nextToken !== cursor?.paging_token || foldedLedger !== lastLedger || newObservedTip !== observedTipLedger) {
-      await saveCursor(contractId, nextToken, foldedLedger, newObservedTip, tip.hash)
+      // Only re-fetch the hash when the folded ledger actually moved — the
+      // hash of a ledger already folded to doesn't change (issue #127: this
+      // stores the hash of `foldedLedger` itself, not the RPC tip's hash).
+      const foldedLedgerHash = foldedLedger !== lastLedger ? await getLedgerHash(foldedLedger) : lastLedgerHash
+      await saveCursor(contractId, nextToken, foldedLedger, newObservedTip, foldedLedgerHash)
       lastLedger = foldedLedger
+      lastLedgerHash = foldedLedgerHash
       observedTipLedger = newObservedTip
       cursorWritten = true
     }
