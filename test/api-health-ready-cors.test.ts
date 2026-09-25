@@ -105,6 +105,29 @@ describe('API: /health and /ready', () => {
     expect(typeof body.secondsSinceUpdate).toBe('number')
   })
 
+  it('GET /ready treats a null updated_at as cold start instead of a NaN-based freshness check (issue #129)', async () => {
+    // updated_at is NOT NULL in schema.sql (always DEFAULT now()), so
+    // reaching this state needs a direct constraint drop — but the code
+    // must not rely on that constraint to stay safe: a `row.updated_at!`
+    // non-null assertion previously hid exactly this case.
+    await query('ALTER TABLE indexer_cursor ALTER COLUMN updated_at DROP NOT NULL')
+    try {
+      await query(
+        `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 100, NULL)`
+      )
+      const res = await app.inject({ method: 'GET', url: '/ready' })
+      expect(res.statusCode).toBe(200)
+      const body = res.json()
+      expect(body.status).toBe('ready')
+      expect(body.indexer).toBe('cold_start')
+      expect(body.lastIndexedLedger).toBeNull()
+      expect(body.secondsSinceUpdate).toBeNull()
+    } finally {
+      await query('DELETE FROM indexer_cursor')
+      await query('ALTER TABLE indexer_cursor ALTER COLUMN updated_at SET NOT NULL')
+    }
+  })
+
   it('GET /ready returns 503 when cursor is stale', async () => {
     // Set updated_at to 10 minutes ago (well past default 120s threshold)
     await query(

@@ -135,7 +135,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       // Table may not exist yet — treat as cold start
     }
 
-    if (!row || row.last_ledger === null) {
+    if (!row || row.last_ledger === null || row.updated_at === null) {
       return reply.code(200).send({
         status: 'ready',
         indexer: 'cold_start',
@@ -147,7 +147,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       })
     }
 
-    const updatedAt = new Date(row.updated_at!).getTime()
+    const updatedAt = new Date(row.updated_at).getTime()
     const secondsSinceUpdate = Math.floor((Date.now() - updatedAt) / 1000)
     const isStale = Date.now() - updatedAt > config.indexer.staleAfterMs
     const lastLedger = row.last_ledger
