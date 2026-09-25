@@ -683,15 +683,40 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // (without touching the append-only `events` row), and moves on. This is
   // the operator-facing view of that; `/api/stats.quarantinedEvents` is the
   // dashboard-facing count.
+  //
+  // Issue #163: the `/admin/` prefix has two different meanings in this file
+  // — `/admin/log` is a public governance audit trail read straight off the
+  // chain, with nothing sensitive in it, while this endpoint surfaces
+  // `failed_events.error`, which is the raw driver/handler exception text
+  // `classifyError` goes to some trouble to keep out of every other
+  // response. Rather than invent an admin-auth scheme this codebase has no
+  // other trace of, `/admin/` here means "operator diagnostics": reachable
+  // without authentication, but never echoing back anything an unauthed
+  // caller couldn't already learn some other way. So the fix mirrors
+  // `classifyError`'s own rule — raw exception text is never put in a
+  // response, only logged (and still queryable directly against Postgres by
+  // an operator) — rather than gating the whole endpoint behind auth.
   app.get('/admin/failed-events', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
     const q = req.query as Record<string, unknown>
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
-    return query<FailedEventRow>(
-      'SELECT * FROM failed_events ORDER BY id DESC LIMIT $1',
-      [l]
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    const params: unknown[] = []
+    let where = ''
+    if (before !== null) {
+      params.push(before)
+      where = `WHERE id < $${params.length}`
+    }
+    params.push(l)
+    const rows = await query<Omit<FailedEventRow, 'error'>>(
+      `SELECT id, event_id, symbol, ledger, created_at
+         FROM failed_events ${where}
+        ORDER BY id DESC LIMIT $${params.length}`,
+      params
     )
+    return rows
   })
 
   // --- Aggregate stats (with indexer freshness — issue #2) ---

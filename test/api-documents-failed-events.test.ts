@@ -87,7 +87,48 @@ describe('API: GET /api/admin/failed-events (issue #43)', () => {
     const body = res.json()
     expect(body).toHaveLength(2)
     expect(body[0].event_id).toBe('2-0')
-    expect(body[0].error).toBe('boom-2')
+  })
+
+  // Issue #163: `error` holds raw driver/handler exception text — a
+  // Postgres error names a constraint, a column and a type; a TypeError
+  // carries internal structure. None of that belongs in a response any
+  // caller (authenticated or not) can read.
+  it('never puts the raw exception text in the response', async () => {
+    await query(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error)
+       VALUES ('1-0', 'loan_dflt', 100, 'duplicate key value violates unique constraint "loans_pkey"')`
+    )
+    const res = await app.inject({ method: 'GET', url: '/api/admin/failed-events' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body).toHaveLength(1)
+    expect(body[0].error).toBeUndefined()
+    expect(res.payload).not.toContain('loans_pkey')
+    expect(res.payload).not.toContain('duplicate key')
+  })
+
+  it('does not cache the response publicly', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/admin/failed-events' })
+    expect(res.headers['cache-control']).toBeUndefined()
+  })
+
+  it('paginates with a before cursor on id', async () => {
+    await query(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error)
+       VALUES ('1-0', 'loan_dflt', 100, 'boom-1'), ('2-0', 'loan_dflt', 200, 'boom-2')`
+    )
+    const first = await app.inject({ method: 'GET', url: '/api/admin/failed-events?limit=1' })
+    const firstBody = first.json()
+    expect(firstBody).toHaveLength(1)
+    expect(firstBody[0].event_id).toBe('2-0')
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/admin/failed-events?limit=1&before=${firstBody[0].id}`,
+    })
+    const secondBody = second.json()
+    expect(secondBody).toHaveLength(1)
+    expect(secondBody[0].event_id).toBe('1-0')
   })
 
   it('the raw events row for a quarantined event is untouched', async () => {
