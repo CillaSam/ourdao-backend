@@ -227,6 +227,58 @@ const handlers: Record<string, Handler> = {
     )
   },
 
+  async loan_wait(client, ev) {
+    const id = requireId(ev, 'id')
+    // The proposal reached quorum but the treasury couldn't cover the
+    // disbursement yet (loans.rs::vote_on_loan_proposal / approve_and_disburse)
+    // — issue #125. A later permissionless `disburse_approved_loan` call
+    // resolves this and republishes `loan_appr`, which the handler above
+    // already folds unconditionally regardless of the proposal's prior
+    // status. Guard on `pending` so a re-delivered `loan_wait` is a no-op.
+    const updated = await client.query<{ borrower: string }>(
+      `UPDATE loan_proposals SET status = 'approved_pending_disbursement', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING borrower`,
+      [id]
+    )
+    const borrower = updated.rows[0]?.borrower
+    if (borrower) {
+      await notify(
+        client,
+        ev,
+        borrower,
+        'info',
+        'Loan approved, awaiting funds',
+        `Proposal #${id} reached quorum but the treasury can't cover it yet — it will be disbursed once funds are available.`
+      )
+    }
+  },
+
+  async loan_rej(client, ev) {
+    const id = requireId(ev, 'id')
+    // Early rejection from inside the same vote call as loan_wait above, when
+    // the votes still outstanding can no longer mathematically reach quorum
+    // (issue #124) — distinct from loan_exp's permissionless-keeper path
+    // below. Guard on `pending` so a re-delivered `loan_rej` is a no-op.
+    const updated = await client.query<{ borrower: string }>(
+      `UPDATE loan_proposals SET status = 'rejected', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING borrower`,
+      [id]
+    )
+    const borrower = updated.rows[0]?.borrower
+    if (borrower) {
+      await notify(
+        client,
+        ev,
+        borrower,
+        'warning',
+        'Loan proposal rejected',
+        `Proposal #${id} could no longer reach quorum and was rejected.`
+      )
+    }
+  },
+
   async loan_appr(client, ev) {
     const f = ev.fields
     const id = requireId(ev, 'id')
@@ -438,6 +490,53 @@ const handlers: Record<string, Handler> = {
     )
   },
 
+  async tre_wait(client, ev) {
+    const id = requireId(ev, 'id')
+    // Treasury equivalent of loan_wait above (issue #125) — reached quorum
+    // but `execute` failed because the treasury can't cover it yet. A later
+    // `execute_treasury_proposal` call resolves this and republishes
+    // `tre_exec`, folded unconditionally by the handler below.
+    const updated = await client.query<{ destination: string }>(
+      `UPDATE treasury_proposals SET status = 'approved_pending_disbursement', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING destination`,
+      [id]
+    )
+    const destination = updated.rows[0]?.destination
+    if (destination) {
+      await notify(
+        client,
+        ev,
+        destination,
+        'info',
+        'Treasury withdrawal approved, awaiting funds',
+        `Proposal #${id} reached quorum but the treasury can't cover it yet — it will execute once funds are available.`
+      )
+    }
+  },
+
+  async tre_rej(client, ev) {
+    const id = requireId(ev, 'id')
+    // Treasury equivalent of loan_rej above (issue #124).
+    const updated = await client.query<{ destination: string }>(
+      `UPDATE treasury_proposals SET status = 'rejected', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING destination`,
+      [id]
+    )
+    const destination = updated.rows[0]?.destination
+    if (destination) {
+      await notify(
+        client,
+        ev,
+        destination,
+        'warning',
+        'Treasury proposal rejected',
+        `Proposal #${id} could no longer reach quorum and was rejected.`
+      )
+    }
+  },
+
   async tre_exec(client, ev) {
     const id = requireId(ev, 'id')
     const destination = requireAddr(ev, 'destination')
@@ -560,18 +659,22 @@ export async function applyEvent(client: PoolClient, ev: DecodedEvent): Promise<
     loan_req: STREAM_CHANNELS.loan_proposals,
     loan_edit: STREAM_CHANNELS.loan_proposals,
     loan_vote: STREAM_CHANNELS.loan_proposals,
+    loan_wait: STREAM_CHANNELS.loan_proposals,
+    loan_rej: STREAM_CHANNELS.loan_proposals,
     loan_appr: STREAM_CHANNELS.loan_proposals,
     loan_exp: STREAM_CHANNELS.loan_proposals,
     loan_reject: STREAM_CHANNELS.loan_proposals,
     loan_disburse: STREAM_CHANNELS.loans,
     loan_repay: STREAM_CHANNELS.loans,
     loan_default: STREAM_CHANNELS.loans,
-    
+
     treasury_req: STREAM_CHANNELS.treasury_proposals,
     treasury_vote: STREAM_CHANNELS.treasury_proposals,
     treasury_appr: STREAM_CHANNELS.treasury_proposals,
     treasury_reject: STREAM_CHANNELS.treasury_proposals,
-    
+    tre_wait: STREAM_CHANNELS.treasury_proposals,
+    tre_rej: STREAM_CHANNELS.treasury_proposals,
+
     interest: STREAM_CHANNELS.interest,
   }
 

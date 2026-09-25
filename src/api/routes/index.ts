@@ -336,7 +336,12 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     const q = req.query as Record<string, unknown>
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
-    return query<LoanProposalRow>('SELECT * FROM loan_proposals ORDER BY id DESC LIMIT $1', [l])
+    const rows = await query<LoanProposalRow>('SELECT * FROM loan_proposals ORDER BY id DESC LIMIT $1', [l])
+    // The contract applies stake-weighted voting internally, but doesn't yet
+    // publish `weight` on `loan_vote` — every tally here is an unweighted
+    // headcount that can disagree with the on-chain result (issue #126).
+    // Flag it explicitly rather than presenting it as authoritative.
+    return rows.map((r) => ({ ...r, tallies_weighted: false }))
   })
 
   // --- Loans (optional ?borrower= filter, ?before=<id> cursor) ---
@@ -404,7 +409,9 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     const q = req.query as Record<string, unknown>
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
-    return query<TreasuryProposalRow>('SELECT * FROM treasury_proposals ORDER BY id DESC LIMIT $1', [l])
+    const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals ORDER BY id DESC LIMIT $1', [l])
+    // See the matching comment on GET /proposals/loan above (issue #126).
+    return rows.map((r) => ({ ...r, tallies_weighted: false }))
   })
 
   // --- A treasury proposal's full event history (issue #26) ---

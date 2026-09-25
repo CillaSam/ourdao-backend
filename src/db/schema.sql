@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS loan_proposals (
   total_repayment NUMERIC(40,0) NOT NULL DEFAULT 0,
   status          TEXT NOT NULL DEFAULT 'pending'
                   CONSTRAINT loan_proposals_status_check
-                  CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
+                  CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled', 'approved_pending_disbursement')),
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   voter_count     INTEGER NOT NULL DEFAULT 0,
@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS treasury_proposals (
   private         BOOLEAN NOT NULL DEFAULT false,
   status          TEXT NOT NULL DEFAULT 'pending'
                   CONSTRAINT treasury_proposals_status_check
-                  CHECK (status IN ('pending', 'executed', 'rejected')),
+                  CHECK (status IN ('pending', 'executed', 'rejected', 'approved_pending_disbursement')),
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   voter_count     INTEGER NOT NULL DEFAULT 0,
